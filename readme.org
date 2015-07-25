@@ -1,0 +1,190 @@
+* Docs
+- http://www.postgresql.org/docs/9.4/static/datatype-json.html
+- http://www.postgresql.org/docs/9.4/static/functions-json.html
+- https://github.com/erthalion/jsonbx
+- http://docs.mongodb.org/manual/reference/operator/query/
+* Tooling
+You would need to install extensions for your PG. The easiest way I
+found to do it on your dev machine is to install `pgxnclient` with
+`pip`:
+
+    pip install pgxnclient
+
+With it you will be able to install and load extensions, example:
+
+    pgxn install jsonbx
+    pgxn load -d test jsonbx
+* Initialization
+JSONB is a data type, so in a table, only a column can be type of
+JSONB. Presumably you still have normal columns like 'id' that is a
+Primary Key and is auto-incremented.
+
+    CREATE TABLE tasks (_id uuid PRIMARY KEY, _data jsonb);
+
+`uuid` type makes something looking like MongoID.
+`jsonb` is what we use to store data.
+
+Now, this is not good enough, because in MongoDB, the id's are
+auto-generated and there are a couple of ways to do this:
+- let your application layer to do this
+- do it in database with a stored procedure
+
+Now, there are multiple stored procedures we could use, but people in
+the Internet tell us to use the extension `uuid-ossp` and use the
+procedure `uuid_generate_v1mc()` because it is based on time and is
+likely to create ordered data, which is good for writes.
+
+So, install the extension:
+
+    CREATE EXTENSION "uuid-ossp";
+    
+And you can now use the procedure as a default value:
+
+    CREATE TABLE tasks (
+      _id uuid PRIMARY KEY DEFAULT uuid_generate_v1mc(),
+      _data jsonb);
+      
+Yay.
+
+* Inserting data
+Something like this in JS:
+
+    Collection.insert({ text: "bla bla", author: "slava" });
+  
+is now
+
+    INSERT INTO tasks (_data) VALUES ('{ "text": "Do dishes.", "author": "slava" }');
+
+Pretty straight forward. If the id is set by application, do this
+instead:
+
+    INSERT INTO tasks VALUES ('1c225a3a-2c70-4d95-b87f-f086cbd20366', '{ "text": "Do dishes.", "author": "slava" }');
+
+* Updating data
+In PG 9.4 you can only replace the column of a row, but with a handy
+`jsonbx` extension (included by default in 9.5), you can update
+individual paths with a convinient function `jsonb_set`.
+
+Install the `jsonbx` extension:
+
+    pgxn install jsonbx
+    pgxn load -d test jsonbx
+
+After that's done, you can update a path:
+
+    UPDATE tasks SET _data = jsonb_set(_data, '{author}', '"sashko"') WHERE _id = 'yourid';
+    
+The second argument is the path. A path in PG looks like this: `{a,b,2,d}`.
+
+Removing individual fields should in theory be implemented by
+`jsonb_delete_path` according to docs, but in reality I got only
+`jsonb_delete` working. Instead you mark your path as type `text[]`
+explicitly:
+
+    SELECT jsonb_delete('{"a":{"c":3},"b":2}', '{a,c}'::text[]);
+    > {"a": {}, "b": 2}
+
+In newer versions, this is built-in as `#-` operator.
+
+* Removing items
+
+Removing is as simple as:
+
+    DELETE FROM tasks WHERE _data @> '{"author": "sashko"}'
+
+There `where` part can use the same selector conversion.
+
+* Selector conversion
+** Equality
+The equality check is trivial to test by using the built-in `@>`
+operator.
+
+    SELECT * FROM tasks WHERE _data @> '{"author":"slava", "stars": 25}'
+
+Combining multiple of them isn't that hard either, as you can see in
+the example.
+
+NOTE: As far as I can tell, this wouldn't work for selections in
+arrays, which is a surprising feature of MongoDB: a selector `{x:1}`
+would match an object `{x: [2, 3, 1]}`.
+
+** $ne, $gt, $lt, $gte, $lte
+All of these are solved by a powerful range of PG operators, combined
+with the `#>>` operator.
+
+Examples for comparisons:
+
+    { stars: { $gte: 15 } }
+    SELECT * FROM tasks WHERE (_data#>>'{stars}')::float >= 15;
+
+Note, how there is a need to explicitly cast the 'stars' field to
+`int` to compare it. We use `float` here to `int` because JSON numbers
+are floats.
+
+NOTE: there might be a need to convert some floats like `1.2-e10`.
+
+
+For `$ne`:
+    
+    { author: { $ne: "sashko" } }
+    SELECT * FROM tasks WHERE _data#>>'{author}' <> 'sashko';
+
+NOTE: if the field doesn't exist, it won't match the `<>`
+operator. This is why we need to turn this actually into an "or the
+field doesn't exist" query with the `?` operator.
+
+NOTE: but if the `$ne` value is `null`, it actually means "match
+everything that has this field", i.e. use the `?` operator.
+
+** $in and $nin
+
+There is a very ugly trick, but it works: use the
+`jsonb_array_elements` procedure and select items from it as a text
+array and then match against the stringified value.
+
+    SELECT '"x"' = ANY(ARRAY(
+      SELECT * FROM jsonb_array_elements('["x", "y"]'))::text[])
+      
+This will give a `True/False` value.
+
+NOTE: the selected value is `JSON.stringify`'ed.
+
+** $or, $and, $nor, $not
+
+Pretty simple, just use SQL's `NOT`, `AND`, `OR`, `NOT (OR ...)`
+operators.
+
+** $exists
+
+This matches the `?` operator.
+
+** $type
+
+XXX
+
+** $mod, $regex, $text, $where
+
+`$mod` is covered by `%`.
+
+NOTE: since the data is schemaless, more work might be required for
+the type checks first.
+
+`$regex` is covered by using the `~` and `!~` operators.
+
+`$where` probably shouldn't be supported in v1.
+
+** $all, $elemMatch, $size
+
+`$all` and `$elemMatch` are more complex versions of `$in`.
+
+`$size` is equivalent to `jsonb_array_length`.
+
+** Optimization ideas
+*** Pull constants
+To make a query smaller and faster, we could pull the fields that need
+to be tested more than once into variables (not sure how to do it in
+SQL yet) just to avoid parsing it from JSON multiple times.
+
+*** Exploit logical short-circuting
+In AND/OR clauses put simple testing first to short-circuit
+earlier. Complex clauses are things like "look into an array".
